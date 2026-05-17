@@ -292,10 +292,11 @@ class DdcSetWorker(QRunnable):
 
 
 class ControlRow(QWidget):
-    def __init__(self, app_cfg: AppConfig, control_cfg: ControlConfig, parent: Optional[QWidget] = None):
+    def __init__(self, app_cfg: AppConfig, control_cfg: ControlConfig, cache_name: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.app_cfg = app_cfg
         self.control_cfg = control_cfg
+        self.cache_name = cache_name
         self.pool = QThreadPool.globalInstance()
 
         self.label = QLabel()
@@ -377,13 +378,16 @@ class ControlRow(QWidget):
         if maximum > 0 and maximum != self.slider.maximum():
             self.slider.setMaximum(maximum)
             self.control_cfg.max_value = maximum
-        self.slider.setValue(max(self.slider.minimum(), min(current, self.slider.maximum())))
+        current = max(self.slider.minimum(), min(current, self.slider.maximum()))
+        self.slider.setValue(current)
         self.slider.blockSignals(False)
+        write_cached_value(self.cache_name, current)
         self.status.setText("letto")
         self.update_label()
 
     def apply_value(self) -> None:
         value = self.slider.value()
+        write_cached_value(self.cache_name, value)
         if self.app_cfg.show_osd:
             show_kde_osd(self.control_cfg.osd_kind, value, self.slider.maximum())
         worker = DdcSetWorker(self.app_cfg, self.control_cfg, value)
@@ -560,8 +564,8 @@ class MainWindow(QMainWindow):
         self.header.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.header)
 
-        self.brightness_row = ControlRow(self.cfg, self.cfg.brightness)
-        self.volume_row = ControlRow(self.cfg, self.cfg.volume)
+        self.brightness_row = ControlRow(self.cfg, self.cfg.brightness, "brightness")
+        self.volume_row = ControlRow(self.cfg, self.cfg.volume, "volume")
         layout.addWidget(self.brightness_row)
         layout.addWidget(self.volume_row)
 
