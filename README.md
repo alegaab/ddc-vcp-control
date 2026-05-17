@@ -384,17 +384,6 @@ ddcutil --bus 8 getvcp 0x62
 
 ---
 
-## AI disclosure
-
-This project was written entirely with the assistance of AI.
-
-The initial code, documentation and project structure were generated with ChatGPT.  
-The maintainer tested the application on real hardware and adjusted the configuration for actual DDC/CI behavior.
-
-Contributions, bug reports and hardware compatibility reports are welcome.
-
----
-
 ## License
 
 MIT License.
