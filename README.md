@@ -54,7 +54,13 @@ DDC VCP Control lets the user choose the VCP codes manually.
 
 ## Screenshot
 
-![DDC VCP Control screenshot](screenshots/main-window.png)
+### Main window
+
+![Main window](screenshots/main-window.png)
+
+### Settings window
+
+![Settings window](screenshots/settings-window.png)
 
 ## Requirements
 
