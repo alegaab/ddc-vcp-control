@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DDC VCP Control
+Comment=Custom DDC/CI VCP controls for monitor brightness and volume
+Exec=ddc-vcp-control
+Icon=video-display
+Terminal=false
+Categories=Settings;HardwareSettings;
+StartupNotify=true

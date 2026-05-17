@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+"""
+DDC VCP Control - mini GUI Qt/PySide6 per controllare VCP DDC/CI custom.
+
+Funzioni:
+- Due slider configurabili: luminosita e volume monitor.
+- VCP modificabili da GUI, es. 0x6B per Fujitsu B24W-7 e 0x62 per speaker volume.
+- Bus I2C modificabile da GUI, es. 8 per /dev/i2c-8.
+- OSD KDE opzionale tramite qdbus/qdbus6.
+- Autostart KDE/XDG configurabile da GUI.
+- Config persistente in ~/.config/ddc-vcp-control/config.json.
+
+Dipendenze:
+- python-pyside6
+- ddcutil
+- opzionale: qt6-tools per qdbus6
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Optional
+
+from PySide6.QtCore import Qt, QTimer, QRunnable, QThreadPool, Signal, QObject
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QSlider,
+    QSystemTrayIcon,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+APP_ID = "ddc-vcp-control"
+APP_NAME = "DDC VCP Control"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_ID
+CONFIG_FILE = CONFIG_DIR / "config.json"
+AUTOSTART_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autostart"
+AUTOSTART_FILE = AUTOSTART_DIR / f"{APP_ID}.desktop"
+
+VCP_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]{2}$")
+
+
+@dataclass
+class ControlConfig:
+    enabled: bool
+    label: str
+    vcp: str
+    min_value: int
+    max_value: int
+    step: int
+    osd_kind: str  # "brightness", "volume", "none"
+
+
+@dataclass
+class AppConfig:
+    bus: str = "8"
+    sleep_multiplier: float = 0.2
+    noverify: bool = True
+    show_osd: bool = True
+    autostart: bool = False
+    close_to_tray: bool = True
+    brightness: ControlConfig = None  # type: ignore[assignment]
+    volume: ControlConfig = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.brightness is None:
+            self.brightness = ControlConfig(
+                enabled=True,
+                label="Luminosita monitor",
+                vcp="0x6B",
+                min_value=0,
+                max_value=100,
+                step=5,
+                osd_kind="brightness",
+            )
+        if self.volume is None:
+            self.volume = ControlConfig(
+                enabled=True,
+                label="Volume monitor",
+                vcp="0x62",
+                min_value=0,
+                max_value=100,
+                step=2,
+                osd_kind="volume",
+            )
+
+
+def normalize_vcp(value: str) -> str:
+    value = value.strip()
+    if not value.lower().startswith("0x"):
+        value = "0x" + value
+    return "0x" + value[2:].upper()
+
+
+def config_to_dict(cfg: AppConfig) -> dict:
+    data = asdict(cfg)
+    return data
+
+
+def dict_to_control(data: dict, fallback: ControlConfig) -> ControlConfig:
+    merged = asdict(fallback)
+    if isinstance(data, dict):
+        merged.update(data)
+    merged["vcp"] = normalize_vcp(str(merged["vcp"]))
+    return ControlConfig(**merged)
+
+
+def load_config() -> AppConfig:
+    default = AppConfig()
+    if not CONFIG_FILE.exists():
+        return default
+
+    try:
+        raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+    cfg = AppConfig()
+    cfg.bus = str(raw.get("bus", cfg.bus))
+    cfg.sleep_multiplier = float(raw.get("sleep_multiplier", cfg.sleep_multiplier))
+    cfg.noverify = bool(raw.get("noverify", cfg.noverify))
+    cfg.show_osd = bool(raw.get("show_osd", cfg.show_osd))
+    cfg.autostart = bool(raw.get("autostart", cfg.autostart))
+    cfg.close_to_tray = bool(raw.get("close_to_tray", cfg.close_to_tray))
+    cfg.brightness = dict_to_control(raw.get("brightness", {}), cfg.brightness)
+    cfg.volume = dict_to_control(raw.get("volume", {}), cfg.volume)
+    return cfg
+
+
+def save_config(cfg: AppConfig) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config_to_dict(cfg), indent=2), encoding="utf-8")
+
+
+def executable_command() -> str:
+    script = Path(sys.argv[0]).resolve()
+    if os.access(script, os.X_OK):
+        return shlex.quote(str(script))
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+
+
+def set_autostart(enabled: bool) -> None:
+    if enabled:
+        AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+        AUTOSTART_FILE.write_text(
+            "\n".join(
+                [
+                    "[Desktop Entry]",
+                    "Type=Application",
+                    f"Name={APP_NAME}",
+                    "Comment=Custom DDC/CI VCP monitor controls",
+                    f"Exec={executable_command()} --tray",
+                    "Icon=video-display",
+                    "Terminal=false",
+                    "Categories=Settings;HardwareSettings;",
+                    "X-GNOME-Autostart-enabled=true",
+                    "X-KDE-autostart-after=panel",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    else:
+        AUTOSTART_FILE.unlink(missing_ok=True)
+
+
+def autostart_enabled() -> bool:
+    return AUTOSTART_FILE.exists()
+
+
+def run_command(args: list[str], timeout: float = 4.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+
+
+def parse_getvcp(text: str) -> Optional[tuple[int, int]]:
+    # Output tipico:
+    # VCP code 0x62 ... current value =    20, max value =   100
+    match = re.search(
+        r"current value\s*=\s*(\d+).*?max value\s*=\s*(\d+)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def get_vcp(bus: str, vcp: str) -> Optional[tuple[int, int, str]]:
+    try:
+        result = run_command(["ddcutil", "--bus", bus, "getvcp", vcp], timeout=5)
+        text = (result.stdout or "") + (result.stderr or "")
+        parsed = parse_getvcp(text)
+        if parsed:
+            return parsed[0], parsed[1], text.strip()
+        return None
+    except Exception:
+        return None
+
+
+def show_kde_osd(kind: str, value: int, maximum: int) -> None:
+    if kind == "none":
+        return
+
+    qdbus = shutil.which("qdbus6") or shutil.which("qdbus")
+    if not qdbus:
+        return
+
+    maximum = max(1, maximum)
+    percent = int(round((value / maximum) * 100))
+    percent = max(0, min(100, percent))
+
+    if kind == "brightness":
+        args = [
+            qdbus,
+            "org.kde.plasmashell",
+            "/org/kde/osdService",
+            "org.kde.osdService.brightnessChanged",
+            str(percent),
+        ]
+    elif kind == "volume":
+        args = [
+            qdbus,
+            "org.kde.plasmashell",
+            "/org/kde/osdService",
+            "org.kde.osdService.volumeChanged",
+            str(percent),
+            "100",
+        ]
+    else:
+        return
+
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class WorkerSignals(QObject):
+    finished = Signal(bool, str)
+
+
+class DdcSetWorker(QRunnable):
+    def __init__(self, cfg: AppConfig, control: ControlConfig, value: int):
+        super().__init__()
+        self.cfg = cfg
+        self.control = control
+        self.value = value
+        self.signals = WorkerSignals()
+
+    def run(self) -> None:
+        args = ["ddcutil", "--bus", self.cfg.bus]
+        if self.cfg.noverify:
+            args.append("--noverify")
+        args += [
+            "--sleep-multiplier",
+            str(self.cfg.sleep_multiplier),
+            "setvcp",
+            self.control.vcp,
+            str(self.value),
+        ]
+        try:
+            result = run_command(args, timeout=6)
+            ok = result.returncode == 0
+            msg = ((result.stdout or "") + (result.stderr or "")).strip()
+            self.signals.finished.emit(ok, msg)
+        except Exception as exc:
+            self.signals.finished.emit(False, str(exc))
+
+
+class ControlRow(QWidget):
+    def __init__(self, app_cfg: AppConfig, control_cfg: ControlConfig, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.app_cfg = app_cfg
+        self.control_cfg = control_cfg
+        self.pool = QThreadPool.globalInstance()
+
+        self.label = QLabel()
+        self.status = QLabel()
+        self.status.setText("")
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(control_cfg.min_value)
+        self.slider.setMaximum(control_cfg.max_value)
+        self.slider.setSingleStep(control_cfg.step)
+        self.slider.setPageStep(control_cfg.step)
+
+        self.minus = QPushButton("−")
+        self.plus = QPushButton("+")
+        self.read_btn = QPushButton("Leggi")
+
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(160)
+        self.timer.timeout.connect(self.apply_value)
+
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(self.label)
+        top.addStretch()
+        top.addWidget(self.status)
+
+        row = QHBoxLayout()
+        row.addWidget(self.minus)
+        row.addWidget(self.slider)
+        row.addWidget(self.plus)
+        row.addWidget(self.read_btn)
+
+        layout.addLayout(top)
+        layout.addLayout(row)
+
+        self.minus.clicked.connect(lambda: self.bump(-self.control_cfg.step))
+        self.plus.clicked.connect(lambda: self.bump(self.control_cfg.step))
+        self.read_btn.clicked.connect(self.read_from_monitor)
+        self.slider.valueChanged.connect(self.on_changed)
+
+        self.read_from_monitor(silent=True)
+        self.update_label()
+
+    def refresh_config(self, app_cfg: AppConfig, control_cfg: ControlConfig) -> None:
+        self.app_cfg = app_cfg
+        self.control_cfg = control_cfg
+        self.slider.blockSignals(True)
+        self.slider.setMinimum(control_cfg.min_value)
+        self.slider.setMaximum(control_cfg.max_value)
+        self.slider.setSingleStep(control_cfg.step)
+        self.slider.setPageStep(control_cfg.step)
+        self.slider.setValue(max(control_cfg.min_value, min(self.slider.value(), control_cfg.max_value)))
+        self.slider.blockSignals(False)
+        self.setVisible(control_cfg.enabled)
+        self.update_label()
+
+    def update_label(self) -> None:
+        self.label.setText(
+            f"{self.control_cfg.label} ({self.control_cfg.vcp}) — {self.slider.value()} / {self.slider.maximum()}"
+        )
+
+    def bump(self, delta: int) -> None:
+        self.slider.setValue(max(self.slider.minimum(), min(self.slider.maximum(), self.slider.value() + delta)))
+
+    def on_changed(self) -> None:
+        self.update_label()
+        self.status.setText("in attesa…")
+        self.timer.start()
+
+    def read_from_monitor(self, silent: bool = False) -> None:
+        result = get_vcp(self.app_cfg.bus, self.control_cfg.vcp)
+        if not result:
+            if not silent:
+                self.status.setText("lettura fallita")
+            return
+        current, maximum, _text = result
+        self.slider.blockSignals(True)
+        if maximum > 0 and maximum != self.slider.maximum():
+            self.slider.setMaximum(maximum)
+            self.control_cfg.max_value = maximum
+        self.slider.setValue(max(self.slider.minimum(), min(current, self.slider.maximum())))
+        self.slider.blockSignals(False)
+        self.status.setText("letto")
+        self.update_label()
+
+    def apply_value(self) -> None:
+        value = self.slider.value()
+        if self.app_cfg.show_osd:
+            show_kde_osd(self.control_cfg.osd_kind, value, self.slider.maximum())
+        worker = DdcSetWorker(self.app_cfg, self.control_cfg, value)
+        worker.signals.finished.connect(self.on_worker_finished)
+        self.pool.start(worker)
+
+    def on_worker_finished(self, ok: bool, msg: str) -> None:
+        self.status.setText("ok" if ok else "errore")
+        if not ok and msg:
+            self.status.setToolTip(msg)
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, cfg: AppConfig, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Impostazioni")
+        self.resize(560, 420)
+        self.cfg = cfg
+
+        layout = QVBoxLayout(self)
+
+        general = QGroupBox("Generale")
+        form = QFormLayout(general)
+
+        self.bus_edit = QLineEdit(cfg.bus)
+        self.sleep_spin = QDoubleSpinBox()
+        self.sleep_spin.setDecimals(2)
+        self.sleep_spin.setRange(0.05, 5.0)
+        self.sleep_spin.setSingleStep(0.05)
+        self.sleep_spin.setValue(cfg.sleep_multiplier)
+
+        self.noverify_check = QCheckBox("Usa --noverify")
+        self.noverify_check.setChecked(cfg.noverify)
+        self.osd_check = QCheckBox("Mostra OSD KDE")
+        self.osd_check.setChecked(cfg.show_osd)
+        self.tray_check = QCheckBox("Chiudi nella tray")
+        self.tray_check.setChecked(cfg.close_to_tray)
+        self.autostart_check = QCheckBox("Avvia automaticamente al login")
+        self.autostart_check.setChecked(autostart_enabled() or cfg.autostart)
+
+        detect_btn = QPushButton("Rileva bus con ddcutil")
+        detect_btn.clicked.connect(self.detect_bus)
+
+        bus_row = QHBoxLayout()
+        bus_row.addWidget(self.bus_edit)
+        bus_row.addWidget(detect_btn)
+
+        form.addRow("Bus I2C, es. 8 per /dev/i2c-8", bus_row)
+        form.addRow("Sleep multiplier ddcutil", self.sleep_spin)
+        form.addRow("", self.noverify_check)
+        form.addRow("", self.osd_check)
+        form.addRow("", self.tray_check)
+        form.addRow("", self.autostart_check)
+
+        layout.addWidget(general)
+
+        self.brightness_box = self.control_group("Luminosita", cfg.brightness)
+        self.volume_box = self.control_group("Volume", cfg.volume)
+        layout.addWidget(self.brightness_box[0])
+        layout.addWidget(self.volume_box[0])
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def control_group(self, title: str, control: ControlConfig):
+        box = QGroupBox(title)
+        grid = QGridLayout(box)
+
+        enabled = QCheckBox("Abilitato")
+        enabled.setChecked(control.enabled)
+        label = QLineEdit(control.label)
+        vcp = QLineEdit(control.vcp)
+
+        minv = QSpinBox()
+        minv.setRange(0, 65535)
+        minv.setValue(control.min_value)
+
+        maxv = QSpinBox()
+        maxv.setRange(1, 65535)
+        maxv.setValue(control.max_value)
+
+        step = QSpinBox()
+        step.setRange(1, 1000)
+        step.setValue(control.step)
+
+        osd = QComboBox()
+        osd.addItems(["brightness", "volume", "none"])
+        osd.setCurrentText(control.osd_kind)
+
+        grid.addWidget(enabled, 0, 0)
+        grid.addWidget(QLabel("Etichetta"), 1, 0)
+        grid.addWidget(label, 1, 1)
+        grid.addWidget(QLabel("VCP"), 2, 0)
+        grid.addWidget(vcp, 2, 1)
+        grid.addWidget(QLabel("Min"), 3, 0)
+        grid.addWidget(minv, 3, 1)
+        grid.addWidget(QLabel("Max"), 4, 0)
+        grid.addWidget(maxv, 4, 1)
+        grid.addWidget(QLabel("Step"), 5, 0)
+        grid.addWidget(step, 5, 1)
+        grid.addWidget(QLabel("OSD"), 6, 0)
+        grid.addWidget(osd, 6, 1)
+
+        return box, enabled, label, vcp, minv, maxv, step, osd
+
+    def read_control_group(self, widgets, old: ControlConfig) -> ControlConfig:
+        _box, enabled, label, vcp, minv, maxv, step, osd = widgets
+        vcp_text = vcp.text().strip()
+        if not VCP_RE.match(vcp_text):
+            raise ValueError(f"VCP non valido: {vcp_text}")
+        if minv.value() >= maxv.value():
+            raise ValueError("Min deve essere minore di Max")
+        return ControlConfig(
+            enabled=enabled.isChecked(),
+            label=label.text().strip() or old.label,
+            vcp=normalize_vcp(vcp_text),
+            min_value=minv.value(),
+            max_value=maxv.value(),
+            step=step.value(),
+            osd_kind=osd.currentText(),
+        )
+
+    def detect_bus(self) -> None:
+        try:
+            result = run_command(["ddcutil", "detect"], timeout=8)
+            text = (result.stdout or "") + (result.stderr or "")
+            buses = re.findall(r"/dev/i2c-(\d+)", text)
+            if not buses:
+                QMessageBox.warning(self, "Rilevamento", "Nessun bus /dev/i2c-* trovato da ddcutil detect.")
+                return
+            self.bus_edit.setText(buses[0])
+            QMessageBox.information(self, "Rilevamento", f"Bus trovato: /dev/i2c-{buses[0]}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Rilevamento", str(exc))
+
+    def accept(self) -> None:
+        try:
+            bus = self.bus_edit.text().strip()
+            if not re.match(r"^\d+$", bus):
+                raise ValueError("Il bus deve essere un numero, es. 8")
+            self.cfg.bus = bus
+            self.cfg.sleep_multiplier = float(self.sleep_spin.value())
+            self.cfg.noverify = self.noverify_check.isChecked()
+            self.cfg.show_osd = self.osd_check.isChecked()
+            self.cfg.close_to_tray = self.tray_check.isChecked()
+            self.cfg.autostart = self.autostart_check.isChecked()
+            self.cfg.brightness = self.read_control_group(self.brightness_box, self.cfg.brightness)
+            self.cfg.volume = self.read_control_group(self.volume_box, self.cfg.volume)
+            save_config(self.cfg)
+            set_autostart(self.cfg.autostart)
+            super().accept()
+        except Exception as exc:
+            QMessageBox.warning(self, "Impostazioni non valide", str(exc))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.cfg = load_config()
+        # Sincronizza lo stato autostart reale col config
+        self.cfg.autostart = autostart_enabled()
+
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(QIcon.fromTheme("video-display"))
+        self.resize(520, 220)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        self.header = QLabel()
+        self.header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.header)
+
+        self.brightness_row = ControlRow(self.cfg, self.cfg.brightness)
+        self.volume_row = ControlRow(self.cfg, self.cfg.volume)
+        layout.addWidget(self.brightness_row)
+        layout.addWidget(self.volume_row)
+
+        buttons = QHBoxLayout()
+        self.settings_btn = QPushButton("Impostazioni")
+        self.read_all_btn = QPushButton("Leggi valori")
+        self.quit_btn = QPushButton("Esci")
+        buttons.addWidget(self.settings_btn)
+        buttons.addWidget(self.read_all_btn)
+        buttons.addStretch()
+        buttons.addWidget(self.quit_btn)
+        layout.addLayout(buttons)
+
+        self.settings_btn.clicked.connect(self.open_settings)
+        self.read_all_btn.clicked.connect(self.read_all)
+        self.quit_btn.clicked.connect(QApplication.quit)
+
+        self.tray: Optional[QSystemTrayIcon] = None
+        self.setup_tray()
+        self.refresh_ui()
+
+    def refresh_ui(self) -> None:
+        self.header.setText(f"Bus DDC/CI: /dev/i2c-{self.cfg.bus}")
+        self.brightness_row.refresh_config(self.cfg, self.cfg.brightness)
+        self.volume_row.refresh_config(self.cfg, self.cfg.volume)
+
+    def open_settings(self) -> None:
+        dlg = SettingsDialog(self.cfg, self)
+        if dlg.exec() == QDialog.Accepted:
+            self.cfg = load_config()
+            self.brightness_row.refresh_config(self.cfg, self.cfg.brightness)
+            self.volume_row.refresh_config(self.cfg, self.cfg.volume)
+            self.refresh_ui()
+
+    def read_all(self) -> None:
+        if self.cfg.brightness.enabled:
+            self.brightness_row.read_from_monitor()
+        if self.cfg.volume.enabled:
+            self.volume_row.read_from_monitor()
+
+    def setup_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(QIcon.fromTheme("video-display"), self)
+        menu = QMenu()
+
+        show_action = QAction("Mostra/Nascondi", self)
+        settings_action = QAction("Impostazioni", self)
+        quit_action = QAction("Esci", self)
+
+        show_action.triggered.connect(self.toggle_visible)
+        settings_action.triggered.connect(self.open_settings)
+        quit_action.triggered.connect(QApplication.quit)
+
+        menu.addAction(show_action)
+        menu.addAction(settings_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.tray_activated)
+        self.tray.show()
+
+    def toggle_visible(self) -> None:
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.Trigger:
+            self.toggle_visible()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self.cfg.close_to_tray and self.tray and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+        else:
+            super().closeEvent(event)
+
+
+def clamp(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def cache_dir() -> Path:
+    path = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / APP_ID
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def cache_file_for(name: str) -> Path:
+    return cache_dir() / f"{name}.value"
+
+
+def lock_file_for(name: str) -> Path:
+    return cache_dir() / f"{name}.lock"
+
+
+def read_cached_value(name: str, fallback: int) -> int:
+    try:
+        return int(cache_file_for(name).read_text(encoding="utf-8").strip())
+    except Exception:
+        return fallback
+
+
+def cached_value_exists(name: str) -> bool:
+    return cache_file_for(name).exists()
+
+
+def write_cached_value(name: str, value: int) -> None:
+    cache_file_for(name).write_text(str(value), encoding="utf-8")
+
+
+def ddcutil_set_args(cfg: AppConfig, control: ControlConfig, value: int) -> list[str]:
+    args = ["ddcutil", "--bus", cfg.bus]
+    if cfg.noverify:
+        args.append("--noverify")
+    args += [
+        "--sleep-multiplier",
+        str(cfg.sleep_multiplier),
+        "setvcp",
+        control.vcp,
+        str(value),
+    ]
+    return args
+
+
+def set_control_value(
+    cfg: AppConfig,
+    control: ControlConfig,
+    value: int,
+    cache_name: str,
+    show_osd_enabled: bool = True,
+    run_ddc: bool = True,
+) -> int:
+    value = clamp(value, control.min_value, control.max_value)
+    write_cached_value(cache_name, value)
+
+    if cfg.show_osd and show_osd_enabled:
+        show_kde_osd(control.osd_kind, value, control.max_value)
+
+    if not run_ddc:
+        return value
+
+    result = run_command(ddcutil_set_args(cfg, control, value), timeout=6)
+    if result.returncode != 0:
+        text = ((result.stdout or "") + (result.stderr or "")).strip()
+        raise RuntimeError(text or "ddcutil setvcp failed")
+    return value
+
+
+def get_current_for_cli(cfg: AppConfig, control: ControlConfig, cache_name: str) -> int:
+    # Modalita rapida per scorciatoie/knob: usa la cache se esiste.
+    # Evita un getvcp a ogni pressione, che e la parte piu lenta.
+    fallback = (control.min_value + control.max_value) // 2
+    if cached_value_exists(cache_name):
+        return read_cached_value(cache_name, fallback)
+
+    result = get_vcp(cfg.bus, control.vcp)
+    if result:
+        current, maximum, _text = result
+        if maximum > 0:
+            control.max_value = maximum
+        write_cached_value(cache_name, current)
+        return current
+
+    write_cached_value(cache_name, fallback)
+    return fallback
+
+
+def control_from_name(cfg: AppConfig, name: str) -> Optional[ControlConfig]:
+    if name == "brightness":
+        return cfg.brightness
+    if name == "volume":
+        return cfg.volume
+    return None
+
+
+def apply_cached_control(cfg: AppConfig, control_name: str) -> int:
+    # Worker di background: applica solo l'ultimo valore richiesto.
+    # Se durante un setvcp arrivano altri input, rilegge la cache e fa un altro giro.
+    import fcntl
+    import time
+
+    control = control_from_name(cfg, control_name)
+    if control is None or not control.enabled:
+        return 1
+
+    lock_path = lock_file_for(control_name)
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+
+        while True:
+            target = read_cached_value(control_name, (control.min_value + control.max_value) // 2)
+            target = clamp(target, control.min_value, control.max_value)
+
+            result = run_command(ddcutil_set_args(cfg, control, target), timeout=6)
+            if result.returncode != 0:
+                text = ((result.stdout or "") + (result.stderr or "")).strip()
+                print(text or "ddcutil setvcp failed", file=sys.stderr)
+                return 1
+
+            time.sleep(0.05)
+            latest = read_cached_value(control_name, target)
+            if latest == target:
+                return 0
+
+
+def spawn_apply_cached_control(control_name: str) -> None:
+    script = Path(sys.argv[0]).resolve()
+    if os.access(script, os.X_OK):
+        command = [str(script), "--apply-cache", control_name]
+    else:
+        command = [sys.executable, str(script), "--apply-cache", control_name]
+
+    subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def run_cli_action(argv: list[str]) -> Optional[int]:
+    if not argv:
+        return None
+
+    action = argv[0].strip().lower()
+
+    if action == "--apply-cache":
+        if len(argv) < 2:
+            return 1
+        cfg = load_config()
+        return apply_cached_control(cfg, argv[1].strip().lower())
+
+    aliases = {
+        "brightness-up": ("brightness", "up"),
+        "brightness-down": ("brightness", "down"),
+        "brightness-set": ("brightness", "set"),
+        "volume-up": ("volume", "up"),
+        "volume-down": ("volume", "down"),
+        "volume-set": ("volume", "set"),
+    }
+
+    if action not in aliases:
+        return None
+
+    if shutil.which("ddcutil") is None:
+        print("ddcutil non trovato nel PATH.", file=sys.stderr)
+        return 1
+
+    cfg = load_config()
+    control_name, operation = aliases[action]
+    control = control_from_name(cfg, control_name)
+
+    if control is None or not control.enabled:
+        print(f"Controllo disabilitato: {control_name}", file=sys.stderr)
+        return 1
+
+    try:
+        if operation == "set":
+            if len(argv) < 2:
+                print(f"Uso: {Path(sys.argv[0]).name} {action} NUM", file=sys.stderr)
+                return 1
+            target = int(argv[1])
+        else:
+            current = get_current_for_cli(cfg, control, control_name)
+            delta = control.step if operation == "up" else -control.step
+            target = current + delta
+
+        # Risposta immediata: cache + OSD subito, DDC/CI in background con coalescing.
+        applied = set_control_value(cfg, control, target, control_name, run_ddc=False)
+        spawn_apply_cached_control(control_name)
+        print(applied)
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def main() -> int:
+    cli_result = run_cli_action(sys.argv[1:])
+    if cli_result is not None:
+        return cli_result
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setQuitOnLastWindowClosed(False)
+
+    if shutil.which("ddcutil") is None:
+        QMessageBox.critical(None, APP_NAME, "ddcutil non trovato nel PATH.")
+        return 1
+
+    window = MainWindow()
+    if "--tray" not in sys.argv:
+        window.show()
+    else:
+        window.hide()
+
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
