@@ -54,9 +54,4 @@ DDC VCP Control lets the user choose the VCP codes manually.
 
 ## Screenshot
 
-Place screenshots in the `screenshots/` folder and add them here later.
-
-Example:
-
-```markdown
 ![DDC VCP Control screenshot](screenshots/main-window.png)
